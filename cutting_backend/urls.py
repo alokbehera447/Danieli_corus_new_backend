@@ -1,7 +1,7 @@
 """
 URL configuration for cutting_backend project.
 """
-
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from django.contrib import admin
 from django.urls import path, include
 from drf_spectacular.views import (
@@ -13,6 +13,8 @@ from drf_spectacular.views import (
 urlpatterns = [
     # Admin
     path('admin/', admin.site.urls),
+    path("auth/login/", TokenObtainPairView.as_view(), name="jwt_login"),
+    path("auth/refresh/", TokenRefreshView.as_view(), name="jwt_refresh"),
 
     # API endpoints
     path('api/', include('planner.urls')),
