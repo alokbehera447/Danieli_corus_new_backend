@@ -1,7 +1,5 @@
 """
-Service layer for interfacing with the existing computational engine in src/.
-
-This module provides a clean abstraction between Django and the core optimization logic.
+Service layer for cutting optimization with trapezoidal prism packing.
 """
 
 import os
@@ -10,31 +8,19 @@ from typing import Dict, List, Tuple, Optional, Any
 from datetime import datetime
 from pathlib import Path
 
-# Add parent directory to path to import from src/
+# Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.geometry.data_classes import StockBlock as SrcStockBlock, TrapezoidalPrism
-from src.utils.config import STOCK_BLOCKS, PART_SPECS, TrapezoidalPrismSpec
-from src.packing.trapezoid_geometry import TrapezoidGeometry
-from src.packing.orientation_explorer import OrientationExplorer
-from src.visualization import GeometryExporter
-
-# Import the hierarchical packing function from step5_mixed_parts.py
-# We'll need to refactor it into an importable function
-from step5_mixed_parts import (
-    hierarchical_packing,
-    MixedPlacedPart,
-    MixedPackingResult,
-    create_stock_geometry,
-)
-
+try:
+    from trapezoidal_packing.pack import pack_trapezoidal_prisms
+    from trapezoidal_packing.fill import draw
+except ImportError:
+    pack_trapezoidal_prisms = None
+    print("Warning: trapezoidal_packing module not found.")
 
 class CuttingOptimizationService:
     """
-    Service for running cutting optimization computations.
-
-    This service interfaces with the existing src/ modules and step5_mixed_parts.py
-    to perform the actual optimization work.
+    Service for running cutting optimization computations with trapezoidal prism packing.
     """
 
     def __init__(self, output_base_dir: str = "outputs"):
@@ -61,17 +47,18 @@ class CuttingOptimizationService:
         config_params: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Run a cutting optimization job.
+        Run a cutting optimization job using trapezoidal prism packing.
 
         Args:
             stock_dimensions: Dict with 'length', 'width', 'height' in mm
             parts_spec: List of part specifications, each with:
                 - name: Part name
                 - quantity: Number of parts desired
-                - W1, W2, D, thickness, alpha: Part dimensions
+                - W1, W2, D, thickness, alpha: Part dimensions (old format)
+                - OR bottom_length, top_length, width, height (new format)
             config_params: Optional configuration parameters:
                 - saw_kerf: Saw blade thickness (default: 0.0)
-                - max_iterations: Max optimization iterations (default: 50)
+                - buffer_spacing: Spacing between parts (default: 2.0)
                 - merging_plane_order: Plane order (default: "XY-X")
 
         Returns:
@@ -80,107 +67,83 @@ class CuttingOptimizationService:
         if config_params is None:
             config_params = {}
 
-        saw_kerf = config_params.get('saw_kerf', 0.0)
-        merging_plane_order = config_params.get('merging_plane_order', 'XY-X')
-
-        # Convert stock dimensions to tuple
-        stock_dims = (
-            stock_dimensions['length'],
-            stock_dimensions['width'],
-            stock_dimensions['height']
-        )
-
-        # Convert parts spec to TrapezoidalPrismSpec dict
-        parts_dict = {}
+        # Convert parts from old format to new format if needed
+        converted_parts = []
         for part in parts_spec:
-            name = part['name']
-            parts_dict[name] = TrapezoidalPrismSpec(
-                name=name,
-                W1=part['W1'],
-                W2=part['W2'],
-                D=part['D'],
-                thickness=part['thickness'],
-                alpha=part.get('alpha', 2.168)
+            # Check if part uses old format (W1, W2, D, thickness)
+            if all(key in part for key in ['W1', 'W2', 'D', 'thickness']):
+                # Convert old format to new format
+                converted_part = {
+                    'name': part['name'],
+                    'bottom_length': part['W1'],      # W1 -> bottom_length
+                    'top_length': part['W2'],         # W2 -> top_length
+                    'width': part['D'],               # D -> width
+                    'height': part['thickness'],      # thickness -> height
+                    'quantity': part.get('quantity', 1),
+                    'alpha': part.get('alpha', 2.168)
+                }
+            else:
+                # Already in new format
+                converted_part = part.copy()
+            
+            # Ensure quantity exists
+            if 'quantity' not in converted_part:
+                converted_part['quantity'] = 1
+            
+            converted_parts.append(converted_part)
+
+        try:
+            if pack_trapezoidal_prisms is None:
+                raise ImportError("trapezoidal_packing module not found")
+
+            # Call trapezoidal packing algorithm
+            results = pack_trapezoidal_prisms(
+                stock_dimensions=stock_dimensions,
+                parts=converted_parts,
+                config_params=config_params,
+                top_n=3
             )
 
-        # Select primary part (use the one with highest quantity or first one)
-        if parts_spec:
-            primary_part_name = max(parts_spec, key=lambda p: p.get('quantity', 1))['name']
-        else:
-            raise ValueError("No parts specified")
+            if not results.get('success', False):
+                raise Exception(results.get('error', 'Optimization failed'))
 
-        # Run hierarchical packing
-        result = hierarchical_packing(
-            stock_dims=stock_dims,
-            primary_part_name=primary_part_name,
-            merging_plane_order=merging_plane_order,
-            saw_kerf=saw_kerf,
-            available_parts=parts_dict,
-            verbose=0  # Silent mode for API
-        )
+            configurations = results.get('configurations', [])
+            
+            # Generate visualization files
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            visualization_files = []
+            
+            for i, config in enumerate(configurations):
+                # Create visualization for each configuration
+                vis_file = self._create_visualization(
+                    config=config,
+                    stock_dimensions=stock_dimensions,
+                    timestamp=timestamp,
+                    config_index=i
+                )
+                if vis_file:
+                    visualization_files.append(vis_file)
+                    # Update config with visualization file path
+                    config['visualization_file'] = vis_file
 
-        if result[0] is None:
-            raise ValueError(f"No valid packing found for {primary_part_name}")
+            return {
+                'success': True,
+                'configurations': configurations,
+                'visualization_files': visualization_files,
+                'total_parts_processed': len(parts_spec),
+                'total_blocks': sum(p.get('quantity', 1) for p in parts_spec),
+                'stock_dimensions': stock_dimensions,
+                'waste_percentage': configurations[0].get('waste', 0) if configurations else 0,
+                'efficiency': configurations[0].get('efficiency', 0) if configurations else 0
+            }
 
-        primary_result, sub_blocks, sub_block_results, bounded_region = result
-
-        # Calculate totals
-        parts_by_type = dict(primary_result.parts_by_type)
-        total_sub_parts = 0
-
-        for sb_result in sub_block_results:
-            if sb_result is not None:
-                part_name, parts = sb_result
-                parts_by_type[part_name] = parts_by_type.get(part_name, 0) + len(parts)
-                total_sub_parts += len(parts)
-
-        total_volume = 0.0
-        for pname, count in parts_by_type.items():
-            if pname in parts_dict:
-                spec = parts_dict[pname]
-                part_vol = ((spec.W1 + spec.W2) / 2.0) * spec.D * spec.thickness
-                total_volume += part_vol * count
-
-        total_parts = len(primary_result.placed_parts) + total_sub_parts
-        stock_volume = stock_dims[0] * stock_dims[1] * stock_dims[2]
-        waste_percentage = (1 - total_volume / stock_volume) * 100
-
-        # Generate visualization
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        job_dir = os.path.join(self.visualizations_dir, f"job_{timestamp}")
-        os.makedirs(job_dir, exist_ok=True)
-
-        exporter = GeometryExporter(job_dir)
-        visualization_file = self._create_visualization(
-            primary_result,
-            sub_block_results,
-            stock_dims,
-            parts_by_type,
-            waste_percentage,
-            exporter,
-            f"job_complete_{timestamp}"
-        )
-
-        return {
-            'total_parts_placed': total_parts,
-            'waste_percentage': waste_percentage,
-            'total_volume_used': total_volume,
-            'stock_volume': stock_volume,
-            'is_extractable': True,  # Hierarchical packing ensures extractability
-            'parts_breakdown': parts_by_type,
-            'primary_part': primary_part_name,
-            'merging_plane_order': merging_plane_order,
-            'visualization_files': [visualization_file],
-            'bounded_region': {
-                'min_x': bounded_region[0],
-                'min_y': bounded_region[1],
-                'min_z': bounded_region[2],
-                'max_x': bounded_region[3],
-                'max_y': bounded_region[4],
-                'max_z': bounded_region[5],
-            },
-            'sub_blocks_count': len(sub_blocks),
-        }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e),
+                'configurations': [],
+                'visualization_files': []
+            }
 
     def compute_top_configurations(
         self,
@@ -190,18 +153,15 @@ class CuttingOptimizationService:
         top_n: int = 3
     ) -> List[Dict[str, Any]]:
         """
-        Compute top N packing configurations.
-
-        This method runs hierarchical packing for multiple primary parts and
-        merging plane orders, then returns the top N by efficiency.
+        Compute top N packing configurations using trapezoidal prism packing.
 
         Args:
             stock_dimensions: Stock block dimensions
             parts_spec: List of available parts
             config_params: Configuration parameters:
                 - saw_kerf: Saw blade thickness
+                - buffer_spacing: Spacing between parts
                 - merging_plane_orders: List of merging plane orders to try
-                - primary_parts_to_test: List of part names to test as primary (optional)
             top_n: Number of top configurations to return (default: 3)
 
         Returns:
@@ -210,178 +170,199 @@ class CuttingOptimizationService:
         if config_params is None:
             config_params = {}
 
-        saw_kerf = config_params.get('saw_kerf', 0.0)
-        merging_plane_orders = config_params.get('merging_plane_orders', ['XY-X', 'XY-Y', 'XZ-X'])
-
-        # Convert stock dimensions
-        stock_dims = (
-            stock_dimensions['length'],
-            stock_dimensions['width'],
-            stock_dimensions['height']
-        )
-
-        # Convert parts spec to TrapezoidalPrismSpec dict
-        parts_dict = {}
+        # Convert parts from old format to new format if needed
+        converted_parts = []
         for part in parts_spec:
-            name = part['name']
-            parts_dict[name] = TrapezoidalPrismSpec(
-                name=name,
-                W1=part['W1'],
-                W2=part['W2'],
-                D=part['D'],
-                thickness=part['thickness'],
-                alpha=part.get('alpha', 2.168)
+            # Check if part uses old format (W1, W2, D, thickness)
+            if all(key in part for key in ['W1', 'W2', 'D', 'thickness']):
+                # Convert old format to new format
+                converted_part = {
+                    'name': part['name'],
+                    'bottom_length': part['W1'],      # W1 -> bottom_length
+                    'top_length': part['W2'],         # W2 -> top_length
+                    'width': part['D'],               # D -> width
+                    'height': part['thickness'],      # thickness -> height
+                    'quantity': part.get('quantity', 1),
+                    'alpha': part.get('alpha', 2.168)
+                }
+            else:
+                # Already in new format
+                converted_part = part.copy()
+            
+            # Ensure quantity exists
+            if 'quantity' not in converted_part:
+                converted_part['quantity'] = 1
+            
+            converted_parts.append(converted_part)
+
+        try:
+            if pack_trapezoidal_prisms is None:
+                raise ImportError("trapezoidal_packing module not found")
+
+            # Call trapezoidal packing algorithm
+            results = pack_trapezoidal_prisms(
+                stock_dimensions=stock_dimensions,
+                parts=converted_parts,
+                config_params=config_params,
+                top_n=top_n
             )
 
-        # Determine which parts to test as primary
-        primary_parts_to_test = config_params.get('primary_parts_to_test')
-        if primary_parts_to_test is None:
-            primary_parts_to_test = sorted(parts_dict.keys())
+            if not results.get('success', False):
+                raise Exception(results.get('error', 'Optimization failed'))
 
-        # Run optimization for all combinations
-        all_configurations = []
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        config_set_dir = os.path.join(self.visualizations_dir, f"configset_{timestamp}")
-        os.makedirs(config_set_dir, exist_ok=True)
-        exporter = GeometryExporter(config_set_dir)
+            configurations = results.get('configurations', [])
+            
+            # Generate visualization files
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            for i, config in enumerate(configurations):
+                # Create visualization for each configuration
+                vis_file = self._create_visualization(
+                    config=config,
+                    stock_dimensions=stock_dimensions,
+                    timestamp=timestamp,
+                    config_index=i
+                )
+                if vis_file:
+                    config['visualization_file'] = vis_file
 
-        for primary_part_name in primary_parts_to_test:
-            if primary_part_name not in parts_dict:
-                continue
+            # Add rank to each configuration
+            for i, config in enumerate(configurations, 1):
+                config['rank'] = i
+                if 'description' not in config:
+                    config['description'] = f'Optimized packing approach {i}'
+                if 'efficiency' not in config:
+                    config['efficiency'] = 100 - config.get('waste', 0)
+                if 'parts_breakdown' not in config:
+                    # Create simple parts breakdown
+                    parts_breakdown = {}
+                    for part in converted_parts:
+                        parts_breakdown[part['name']] = part.get('quantity', 1)
+                    config['parts_breakdown'] = parts_breakdown
 
-            for merging_plane_order in merging_plane_orders:
-                try:
-                    result = hierarchical_packing(
-                        stock_dims=stock_dims,
-                        primary_part_name=primary_part_name,
-                        merging_plane_order=merging_plane_order,
-                        saw_kerf=saw_kerf,
-                        available_parts=parts_dict,
-                        verbose=0
-                    )
+            return configurations
 
-                    if result[0] is None:
-                        continue
-
-                    primary_result, sub_blocks, sub_block_results, bounded_region = result
-
-                    # Calculate totals
-                    parts_by_type = dict(primary_result.parts_by_type)
-                    total_sub_parts = 0
-
-                    for sb_result in sub_block_results:
-                        if sb_result is not None:
-                            part_name, parts = sb_result
-                            parts_by_type[part_name] = parts_by_type.get(part_name, 0) + len(parts)
-                            total_sub_parts += len(parts)
-
-                    total_volume = 0.0
-                    for pname, count in parts_by_type.items():
-                        if pname in parts_dict:
-                            spec = parts_dict[pname]
-                            part_vol = ((spec.W1 + spec.W2) / 2.0) * spec.D * spec.thickness
-                            total_volume += part_vol * count
-
-                    total_parts = len(primary_result.placed_parts) + total_sub_parts
-                    stock_volume = stock_dims[0] * stock_dims[1] * stock_dims[2]
-                    waste_percentage = (1 - total_volume / stock_volume) * 100
-
-                    # Generate visualization
-                    config_name = f"{primary_part_name}_{merging_plane_order}"
-                    visualization_file = self._create_visualization(
-                        primary_result,
-                        sub_block_results,
-                        stock_dims,
-                        parts_by_type,
-                        waste_percentage,
-                        exporter,
-                        f"config_{config_name}_{timestamp}"
-                    )
-
-                    all_configurations.append({
-                        'primary_part': primary_part_name,
-                        'merging_plane_order': merging_plane_order,
-                        'total_parts': total_parts,
-                        'total_volume_used': total_volume,
-                        'waste_percentage': waste_percentage,
-                        'is_extractable': True,
-                        'parts_breakdown': parts_by_type,
-                        'visualization_file': visualization_file,
-                        'summary': self._generate_summary(parts_by_type, waste_percentage),
-                    })
-
-                except Exception as e:
-                    # Skip failed configurations
-                    print(f"Error processing {primary_part_name} with {merging_plane_order}: {e}")
-                    continue
-
-        # Sort by waste percentage (ascending) and return top N
-        all_configurations.sort(key=lambda x: x['waste_percentage'])
-        top_configs = all_configurations[:top_n]
-
-        # Add rank to each configuration
-        for i, config in enumerate(top_configs, 1):
-            config['rank'] = i
-
-        return top_configs
+        except Exception as e:
+            print(f"Error in compute_top_configurations: {e}")
+            return []
 
     def _create_visualization(
         self,
-        primary_result: MixedPackingResult,
-        sub_block_results: List,
-        stock_dims: Tuple[float, float, float],
-        parts_by_type: Dict[str, int],
-        waste_percentage: float,
-        exporter: GeometryExporter,
-        filename: str
+        config: Dict[str, Any],
+        stock_dimensions: Dict[str, float],
+        timestamp: str,
+        config_index: int
     ) -> str:
         """
-        Create Plotly HTML visualization.
-
+        Create visualization for a configuration.
+        
+        Note: This is a placeholder. You'll need to integrate your 
+        trapezoidal_packing.fill.draw() function here.
+        
         Returns:
-            Relative path to visualization file
+            Path to visualization file
         """
-        import cadquery as cq
+        try:
+            # Create a unique filename
+            filename = f"visualization_{timestamp}_config{config_index+1}.html"
+            filepath = os.path.join(self.visualizations_dir, filename)
+            
+            # For now, create a simple HTML file
+            # You should replace this with your actual drawing function
+            with open(filepath, 'w') as f:
+                f.write(self._generate_html_visualization(config, stock_dimensions))
+            
+            # Return relative path from outputs directory
+            return os.path.relpath(filepath, self.output_base_dir)
+            
+        except Exception as e:
+            print(f"Error creating visualization: {e}")
+            return ""
 
-        stock_geom = create_stock_geometry(*stock_dims)
-        geometries = [(stock_geom, "Stock", "lightgray", 0.05)]
+    def _generate_html_visualization(self, config: Dict[str, Any], stock_dimensions: Dict[str, float]) -> str:
+        """Generate simple HTML visualization."""
+        waste = config.get('waste', 0)
+        efficiency = config.get('efficiency', 100 - waste)
+        primary_part = config.get('primary_part', 'Unknown')
+        merging_plane_order = config.get('merging_plane_order', 'XY-X')
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Trapezoidal Prism Packing Visualization</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 40px; }}
+                .container {{ max-width: 800px; margin: 0 auto; }}
+                .header {{ background: #f0f0f0; padding: 20px; border-radius: 5px; }}
+                .stats {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 20px 0; }}
+                .stat-box {{ background: #f8f9fa; padding: 15px; border-radius: 5px; }}
+                .stat-value {{ font-size: 24px; font-weight: bold; color: #007bff; }}
+                .visualization {{ 
+                    background: #fff; 
+                    border: 1px solid #ddd; 
+                    padding: 20px; 
+                    text-align: center;
+                    min-height: 400px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>Trapezoidal Prism Packing Visualization</h1>
+                    <p>Stock Dimensions: {stock_dimensions['length']} × {stock_dimensions['width']} × {stock_dimensions['height']} mm</p>
+                </div>
+                
+                <div class="stats">
+                    <div class="stat-box">
+                        <div class="stat-label">Efficiency</div>
+                        <div class="stat-value">{efficiency:.1f}%</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-label">Waste</div>
+                        <div class="stat-value">{waste:.1f}%</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-label">Primary Part</div>
+                        <div class="stat-value">{primary_part}</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-label">Merging Plane</div>
+                        <div class="stat-value">{merging_plane_order}</div>
+                    </div>
+                </div>
+                
+                <div class="visualization">
+                    <div>
+                        <h3>3D Visualization</h3>
+                        <p>Interactive 3D visualization would appear here.</p>
+                        <p><em>Note: This is a placeholder. Actual visualization requires Plotly integration.</em></p>
+                    </div>
+                </div>
+                
+                <div style="margin-top: 20px; padding: 15px; background: #e8f4fd; border-radius: 5px;">
+                    <h3>Configuration Details</h3>
+                    <pre style="background: white; padding: 15px; border-radius: 3px; overflow: auto;">
+{self._format_config_details(config)}
+                    </pre>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        return html
 
-        # Add primary parts
-        for part in primary_result.placed_parts:
-            label = f"{part.part_spec_name}_{part.part_id}"
-            geometries.append((part.geometry, label, "#2ecc71", 0.7))
-
-        # Add sub-block parts
-        sub_block_colors = ["#e74c3c", "#3498db", "#9b59b6", "#f39c12", "#1abc9c"]
-        for i, result in enumerate(sub_block_results):
-            if result is None:
-                continue
-            part_name, parts = result
-            color = sub_block_colors[i % len(sub_block_colors)]
-
-            for part in parts:
-                label = f"{part_name}_{part.part_id}_SB{i+1}"
-                geometries.append((part.geometry, label, color, 0.7))
-
-        # Create title
-        parts_summary = " + ".join([
-            f"{count} {name}" for name, count in sorted(parts_by_type.items(), key=lambda x: -x[1])
-        ])
-        title = f"{parts_summary} | {waste_percentage:.1f}% Waste"
-
-        # Export visualization
-        exporter.export_combined(geometries, filename, title)
-
-        # Return relative path from outputs directory
-        full_path = os.path.join(exporter.output_dir, f"{filename}.html")
-        return os.path.relpath(full_path, self.output_base_dir)
-
-    def _generate_summary(self, parts_by_type: Dict[str, int], waste_percentage: float) -> str:
-        """Generate human-readable summary."""
-        parts_str = " + ".join([
-            f"{count} {name}" for name, count in sorted(parts_by_type.items(), key=lambda x: -x[1])
-        ])
-        return f"{parts_str} and {waste_percentage:.1f}% Waste"
+    def _format_config_details(self, config: Dict[str, Any]) -> str:
+        """Format configuration details for display."""
+        import json
+        # Remove visualization file path for cleaner display
+        display_config = config.copy()
+        display_config.pop('visualization_file', None)
+        return json.dumps(display_config, indent=2, default=str)
 
 
 # Singleton instance

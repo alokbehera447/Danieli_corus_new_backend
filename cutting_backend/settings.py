@@ -6,12 +6,21 @@ import os
 import sys
 from pathlib import Path
 from decouple import config, Csv
+from datetime import timedelta
 
 # Build paths inside the project
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Add project root to Python path to enable imports from src/
 sys.path.insert(0, str(BASE_DIR))
+
+# Load environment variables - prioritize .env.local for development
+if os.path.exists('.env.local'):
+    ENV_FILE = '.env.local'
+    print(f"[DEBUG] Loading environment from: {ENV_FILE}")
+else:
+    ENV_FILE = '.env'
+    print(f"[DEBUG] Loading environment from: {ENV_FILE}")
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = config(
@@ -23,6 +32,18 @@ SECRET_KEY = config(
 DEBUG = config('DEBUG', default=True, cast=bool)
 
 ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost,127.0.0.1', cast=Csv())
+
+if not DEBUG:
+    # Production security settings
+    SECURE_SSL_REDIRECT = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_BROWSER_XSS_FILTER = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_HSTS_SECONDS = 31536000  # 1 year
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 # Application definition
 INSTALLED_APPS = [
@@ -38,6 +59,7 @@ INSTALLED_APPS = [
     'corsheaders',
     'django_filters',
     'drf_spectacular',
+    'rest_framework_simplejwt',  # ADD THIS for JWT
 
     # Local apps
     'planner.apps.PlannerConfig',
@@ -77,25 +99,28 @@ WSGI_APPLICATION = 'cutting_backend.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/5.1/ref/settings/#databases
 
-# Try PostgreSQL first, fall back to SQLite
-if config('DB_NAME', default=None):
+# Check if DB_NAME is provided in .env file
+DB_NAME = config('DB_NAME', default='')
+if DB_NAME:  # If DB_NAME is provided in .env, use PostgreSQL
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.postgresql',
-            'NAME': config('DB_NAME'),
-            'USER': config('DB_USER'),
-            'PASSWORD': config('DB_PASSWORD'),
+            'NAME': DB_NAME,
+            'USER': config('DB_USER', default=''),
+            'PASSWORD': config('DB_PASSWORD', default=''),
             'HOST': config('DB_HOST', default='localhost'),
             'PORT': config('DB_PORT', default='5432'),
         }
     }
-else:
+    print(f"[DEBUG] Using PostgreSQL database: {DB_NAME}")
+else:  # Otherwise, use SQLite for development
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',
             'NAME': BASE_DIR / 'db.sqlite3',
         }
     }
+    print(f"[DEBUG] Using SQLite database")
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
@@ -135,6 +160,13 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # REST Framework settings
 REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'rest_framework.authentication.SessionAuthentication',  # For admin
+    ],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+    ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
     'DEFAULT_FILTER_BACKENDS': [
@@ -153,6 +185,34 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
     'EXCEPTION_HANDLER': 'rest_framework.views.exception_handler',
+}
+
+# JWT Settings
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(hours=1),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=1),
+    'ROTATE_REFRESH_TOKENS': False,
+    'BLACKLIST_AFTER_ROTATION': True,
+    'UPDATE_LAST_LOGIN': False,
+    'ALGORITHM': 'HS256',
+    'SIGNING_KEY': SECRET_KEY,
+    'VERIFYING_KEY': None,
+    'AUDIENCE': None,
+    'ISSUER': None,
+    'JWK_URL': None,
+    'LEEWAY': 0,
+    'AUTH_HEADER_TYPES': ('Bearer',),
+    'AUTH_HEADER_NAME': 'HTTP_AUTHORIZATION',
+    'USER_ID_FIELD': 'id',
+    'USER_ID_CLAIM': 'user_id',
+    'USER_AUTHENTICATION_RULE': 'rest_framework_simplejwt.authentication.default_user_authentication_rule',
+    'AUTH_TOKEN_CLASSES': ('rest_framework_simplejwt.tokens.AccessToken',),
+    'TOKEN_TYPE_CLAIM': 'token_type',
+    'TOKEN_USER_CLASS': 'rest_framework_simplejwt.models.TokenUser',
+    'JTI_CLAIM': 'jti',
+    'SLIDING_TOKEN_REFRESH_EXP_CLAIM': 'refresh_exp',
+    'SLIDING_TOKEN_LIFETIME': timedelta(minutes=5),
+    'SLIDING_TOKEN_REFRESH_LIFETIME': timedelta(days=1),
 }
 
 # DRF Spectacular settings (OpenAPI/Swagger)
@@ -179,6 +239,19 @@ if not CORS_ALLOW_ALL_ORIGINS:
         cast=Csv()
     )
 
+CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_HEADERS = [
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
+]
+
 # Logging configuration
 LOGGING = {
     'version': 1,
@@ -186,6 +259,10 @@ LOGGING = {
     'formatters': {
         'verbose': {
             'format': '{levelname} {asctime} {module} {message}',
+            'style': '{',
+        },
+        'simple': {
+            'format': '{levelname} {message}',
             'style': '{',
         },
     },
@@ -218,6 +295,23 @@ LOGGING = {
     },
 }
 
+
+
+
+# Media file serving
+if DEBUG:
+    # Serve media files in development
+    MEDIA_URL = '/media/'
+else:
+    # In production, media files should be served by your web server (nginx/apache)
+    MEDIA_URL = '/media/'
+    # Or use a CDN URL
+    # MEDIA_URL = 'https://your-cdn-domain.com/media/'
+
+# Ensure the media directory exists
+import os
+os.makedirs(MEDIA_ROOT / 'visualizations', exist_ok=True)
+
 # Create logs directory if it doesn't exist
 os.makedirs(BASE_DIR / 'outputs' / 'logs', exist_ok=True)
 
@@ -238,3 +332,10 @@ EXPORTS_DIR = OUTPUTS_DIR / 'exports'
 # Ensure output directories exist
 for directory in [OUTPUTS_DIR, VISUALIZATIONS_DIR, REPORTS_DIR, EXPORTS_DIR]:
     os.makedirs(directory, exist_ok=True)
+
+X_FRAME_OPTIONS = 'ALLOWALL'
+
+# Print debug info
+print(f"[DEBUG] DEBUG mode: {DEBUG}")
+print(f"[DEBUG] ALLOWED_HOSTS: {ALLOWED_HOSTS}")
+print(f"[DEBUG] CORS_ALLOW_ALL_ORIGINS: {CORS_ALLOW_ALL_ORIGINS}")
