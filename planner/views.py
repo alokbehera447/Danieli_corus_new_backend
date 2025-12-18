@@ -1,3 +1,10 @@
+# ================================
+# GLOBAL OPTIMIZATION STATE (DEV)
+# ================================
+
+GLOBAL_OPTIMIZATION_STATE = {
+    "helper": None
+}
 """
 API views for the cutting optimization planner.
 """
@@ -15,6 +22,7 @@ import os
 import pandas as pd
 import json
 import sys
+import time
 
 # Add the project root to Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -49,6 +57,8 @@ except ImportError as e:
     Prisms = None
     run_final_code = None
     get_block_details = None
+
+
 
 
 # ================================
@@ -239,167 +249,125 @@ def upload_excel_file(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def generate_block_visualization(request, block_code):
-    """
-    Generate 3D visualization for a specific block
-    
-    POST /api/visualization/block/{block_code}/
-    """
     try:
-        # Import visualization modules
-        try:
-            import plotly.graph_objects as go
-            import plotly.io as pio
-            from datetime import datetime
-        except ImportError:
-            return Response({
-                'success': False,
-                'error': 'Plotly library not installed for visualization'
-            }, status=500)
-        
-        # For now, create a simple visualization
-        # In a real implementation, you would use actual block data
-        
-        fig = go.Figure(data=[
-            go.Mesh3d(
-                x=[0, 1, 1, 0, 0, 1, 1, 0],
-                y=[0, 0, 1, 1, 0, 0, 1, 1],
-                z=[0, 0, 0, 0, 1, 1, 1, 1],
-                i=[7, 0, 0, 0, 4, 4, 6, 6, 4, 0, 3, 2],
-                j=[3, 4, 1, 2, 5, 6, 5, 2, 0, 1, 6, 3],
-                k=[0, 7, 2, 3, 6, 7, 1, 1, 5, 5, 7, 6],
-                color='lightblue',
-                opacity=0.50,
-                name=f'Block {block_code}'
-            )
-        ])
-        
-        fig.update_layout(
-            title=f'3D Visualization - Block {block_code}',
-            scene=dict(
-                xaxis_title='Length (mm)',
-                yaxis_title='Width (mm)',
-                zaxis_title='Height (mm)'
-            ),
-            height=600
-        )
-        
-        # Convert to HTML
-        html_content = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
-        
-        # Save to temporary directory
         from django.conf import settings
-        import os
-        
-        viz_dir = os.path.join(settings.MEDIA_ROOT, 'visualizations')
+        from django.core.cache import cache
+        from datetime import datetime
+        import os, time
+
+        # 🔒 Wait for helper (Gunicorn-safe)
+        helper = None
+        for _ in range(20):
+            helper = cache.get("latest_helper")
+            if helper is not None:
+                break
+            time.sleep(0.2)
+
+        if helper is None:
+            return Response({
+                "success": False,
+                "error": "Optimization data not ready. Please retry."
+            }, status=400)
+
+        block_index = int(block_code.replace("B", "")) - 1
+
+        if block_index < 0 or block_index >= len(helper.all_big_blocks):
+            return Response({
+                "success": False,
+                "error": "Invalid block code"
+            }, status=400)
+
+        block = helper.all_big_blocks[block_index]
+
+        viz_dir = os.path.join(settings.MEDIA_ROOT, "visualizations")
         os.makedirs(viz_dir, exist_ok=True)
-        
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"block_{block_code}_{timestamp}.html"
+
+        filename = f"block_{block.unique_code}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
         filepath = os.path.join(viz_dir, filename)
-        
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(html_content)
-        
-        # Create URL
-        viz_url = f"/media/visualizations/{filename}"
-        
+
+        block.draw_it(only_scrap=False, save_path=filepath)
+
+        # ⏳ wait for file write
+        for _ in range(30):
+            if os.path.exists(filepath) and os.path.getsize(filepath) > 1024:
+                break
+            time.sleep(0.1)
+
         return Response({
-            'success': True,
-            'visualization_url': viz_url,
-            'message': f'3D visualization generated for block {block_code}'
+            "success": True,
+            "visualization_url": f"/media/visualizations/{filename}"
         })
-        
+
     except Exception as e:
-        print(f"[Visualization] Error: {str(e)}")
         import traceback
         traceback.print_exc()
-        
         return Response({
-            'success': False,
-            'error': str(e)
+            "success": False,
+            "error": str(e)
         }, status=500)
+
+
 
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def generate_scrap_visualization(request, scrap_code):
-    """
-    Generate 3D visualization for a specific scrap
-    
-    POST /api/visualization/scrap/{scrap_code}/
-    """
     try:
-        # Import visualization modules
-        try:
-            import plotly.graph_objects as go
-            import plotly.io as pio
-            from datetime import datetime
-        except ImportError:
-            return Response({
-                'success': False,
-                'error': 'Plotly library not installed for visualization'
-            }, status=500)
-        
-        # Create a simple scrap visualization
-        fig = go.Figure(data=[
-            go.Mesh3d(
-                x=[0, 0.5, 0.5, 0, 0, 0.5, 0.5, 0],
-                y=[0, 0, 0.3, 0.3, 0, 0, 0.3, 0.3],
-                z=[0, 0, 0, 0, 0.2, 0.2, 0.2, 0.2],
-                i=[7, 0, 0, 0, 4, 4, 6, 6, 4, 0, 3, 2],
-                j=[3, 4, 1, 2, 5, 6, 5, 2, 0, 1, 6, 3],
-                k=[0, 7, 2, 3, 6, 7, 1, 1, 5, 5, 7, 6],
-                color='orange',
-                opacity=0.50,
-                name=f'Scrap {scrap_code}'
-            )
-        ])
-        
-        fig.update_layout(
-            title=f'3D Visualization - Scrap {scrap_code}',
-            scene=dict(
-                xaxis_title='Length (mm)',
-                yaxis_title='Width (mm)',
-                zaxis_title='Height (mm)'
-            ),
-            height=600
-        )
-        
-        # Convert to HTML
-        html_content = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
-        
-        # Save to temporary directory
         from django.conf import settings
-        import os
-        
-        viz_dir = os.path.join(settings.MEDIA_ROOT, 'visualizations')
+        from django.core.cache import cache
+        from datetime import datetime
+        import os, time
+
+        helper = None
+        for _ in range(20):
+            helper = cache.get("latest_helper")
+            if helper is not None:
+                break
+            time.sleep(0.2)
+
+        if helper is None:
+            return Response({
+                "success": False,
+                "error": "Optimization data not ready. Please retry."
+            }, status=400)
+
+        scrap = next(
+            (s for s in helper.all_scrap if s.unique_code == scrap_code),
+            None
+        )
+
+        if scrap is None:
+            return Response({
+                "success": False,
+                "error": "Invalid scrap code"
+            }, status=404)
+
+        viz_dir = os.path.join(settings.MEDIA_ROOT, "visualizations")
         os.makedirs(viz_dir, exist_ok=True)
-        
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"scrap_{scrap_code}_{timestamp}.html"
+
+        filename = f"scrap_{scrap.unique_code}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
         filepath = os.path.join(viz_dir, filename)
-        
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(html_content)
-        
-        # Create URL
-        viz_url = f"/media/visualizations/{filename}"
-        
+
+        scrap.draw_scrap(save_path=filepath)
+
+        for _ in range(30):
+            if os.path.exists(filepath) and os.path.getsize(filepath) > 1024:
+                break
+            time.sleep(0.1)
+
         return Response({
-            'success': True,
-            'visualization_url': viz_url,
-            'message': f'3D visualization generated for scrap {scrap_code}'
+            "success": True,
+            "visualization_url": f"/media/visualizations/{filename}"
         })
-        
+
     except Exception as e:
-        print(f"[Visualization] Error: {str(e)}")
         import traceback
         traceback.print_exc()
-        
         return Response({
-            'success': False,
-            'error': str(e)
+            "success": False,
+            "error": str(e)
         }, status=500)
+
 
 
 @api_view(['GET'])
@@ -602,6 +570,18 @@ def upload_and_optimize(request):
                 buffer=buffer_spacing,
                 parent_block_sizes=parent_block_sizes
             )
+
+            # 🔥 STORE HELPER (Django-safe)
+            # GLOBAL_OPTIMIZATION_STATE["helper"] = helper
+
+            from django.core.cache import cache
+
+            cache.set(
+                "latest_helper",
+                helper,
+                timeout=60 * 60  # 1 hour
+            )
+
         except Exception as e:
             print(f"ERROR in run_final_code: {str(e)}")
             import traceback

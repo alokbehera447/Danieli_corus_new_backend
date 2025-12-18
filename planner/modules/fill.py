@@ -367,8 +367,8 @@ def draw(big_block_coordinate, co_ordinates_list, x_edges=[], y_edges=[], z_edge
         height=700
     )
 
-    
-    fig.show()
+    # fig.show()
+    return fig
 
     
 import numpy as np

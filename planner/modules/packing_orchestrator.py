@@ -232,34 +232,70 @@ class Block:
             [x, y, z + height], [x + length, y, z + height], [x + length, y + width, z + height], [x, y + width, z + height]
         ]
 
-    def draw_it(self, only_scrap=False):
-        """
-        Draw the block similar to Jupyter notebook draw_it:
-        - if only_scrap: draw only scrap volumes
-        - else: draw prisms coordinates (filling)
-        Uses `draw` imported from fill module (if available).
-        """
+    def draw_it(self, only_scrap=False, save_path=None):
         big_block_coordinate = self.box_coordinate
         co_ordinates_list = self.all_prisms_coordinates
-        scrap_volumes = []
-        for scrap in self.scraps:
-            scrap_volumes.append(scrap.box_coordinate)
-        if only_scrap:
-            draw(big_block_coordinate, co_ordinates_list=[], x_edges=[], y_edges=[], z_edges=[],
-                 planes={"xy_planes": [], "zx_planes": [], "yz_planes": []}, scrap_volumes=scrap_volumes)
-        else:
-            draw(big_block_coordinate, co_ordinates_list, x_edges=[], y_edges=[], z_edges=[],
-                 planes={"xy_planes": [], "zx_planes": [], "yz_planes": []}, scrap_volumes=[])
+        scrap_volumes = [s.box_coordinate for s in self.scraps]
+    
+        fig = draw(
+            big_block_coordinate,
+            [] if only_scrap else co_ordinates_list,
+            x_edges=[],
+            y_edges=[],
+            z_edges=[],
+            planes={"xy_planes": [], "zx_planes": [], "yz_planes": []},
+            scrap_volumes=scrap_volumes if only_scrap else []
+        )
+    
+        if save_path:
+            with open(save_path, "w") as f:
+                f.write(fig.to_html(full_html=True))
+    
+        return fig
+
 
 
 class Scrap(Block):
     def __init__(self, unique_code, size, start_coord):
         super().__init__(unique_code, size, start_coord)
-        self.parent_block = None    # this will be assigned when added
+        self.parent_block = None
 
     def delete_scrap(self):
         if self.parent_block and self in self.parent_block.scraps:
             self.parent_block.scraps.remove(self)
+
+    def draw_scrap(self, save_path=None):
+        if not self.parent_block:
+            raise RuntimeError("Scrap has no parent block")
+
+        fig = draw(
+            self.parent_block.box_coordinate,
+            co_ordinates_list=[],
+            x_edges=[],
+            y_edges=[],
+            z_edges=[],
+            planes={"xy_planes": [], "zx_planes": [], "yz_planes": []},
+            scrap_volumes=[self.box_coordinate]
+        )
+
+        if fig is None:
+            raise RuntimeError("draw() returned None for scrap visualization")
+
+        fig.update_layout(
+            title=f"3D Scrap Visualization ({self.unique_code})",
+            scene=dict(aspectmode="data"),
+            width=900,
+            height=700
+        )
+
+        if save_path:
+            with open(save_path, "w") as f:
+                f.write(fig.to_html(full_html=True))
+
+        return fig
+
+
+
 
 
 class People_helper:
@@ -488,26 +524,40 @@ class People_helper:
         scrap.delete_scrap()
 
 
-def run_final_code(all_prisms, buffer=2, parent_block_sizes=[[1870, 800, 350], [2000, 800, 400]]):
-    """
-    Reproduce notebook flow: helper tries to pack prisms using existing scraps,
-    creates new blocks as needed and fills them until all prisms consumed.
-    """
+def run_final_code(all_prisms, buffer=2, parent_block_sizes=[[1870,800,350], [2000,800,400]]):
     helper = People_helper(buffer, parent_block_sizes)
-    for prism in all_prisms[:]:
-        helper.try_to_pack_inside_all_scrap(prism)
-        while True:
-            if prism.prism_left == 0:
-                break
-            # create a block
-            size = helper.check_which_block_to_add(prism)
-            if size is None:
-                # No block can contain this prism (matches notebook handling)
-                break
-            b = helper.add_one_big_block(size)
-            co_ordinates_list, big_block_coordinate, scrap_volumes, prism_count, scrap_blocks_list_temp = helper.fill_the_prism_optimally(
-                prism, b)
-            helper.try_to_pack_inside_all_scrap(prism, scrap_blocks_list_temp)
+    all_prisms_sorted = sorted(
+    all_prisms,
+    key=lambda p: p.get_volume(),
+    reverse=True
+)
+
+    for prism in all_prisms_sorted:
+        # KEEP TRYING UNTIL THIS PRISM IS FULLY PLACED
+        while prism.prism_left > 0:
+
+            # 1️⃣ Try ALL scraps repeatedly
+            packed_in_scrap = True
+            while packed_in_scrap:
+                packed_in_scrap = False
+
+                for scrap in sorted(helper.all_scrap, key=lambda s: s.volume, reverse=True):
+                    result = helper.fill_the_prism_optimally(prism, scrap)
+
+                    # result[3] = prism_count
+                    if result and result[3] and result[3] > 0:
+                        packed_in_scrap = True
+                        break   # restart scrap loop
+
+            # 2️⃣ If still left, create ONE new block
+            if prism.prism_left > 0:
+                size = helper.check_which_block_to_add(prism)
+                if size is None:
+                    break
+
+                block = helper.add_one_big_block(size)
+                helper.fill_the_prism_optimally(prism, block)
+
     return helper
 
 

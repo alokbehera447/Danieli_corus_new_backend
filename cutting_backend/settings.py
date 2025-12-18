@@ -95,6 +95,22 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'cutting_backend.wsgi.application'
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "packing-cache",
+    }
+}
+
+
+# from django.core.cache import cache
+
+# cache.set(
+#     "latest_helper",
+#     helper,
+#     timeout=60 * 60
+# )
+
 
 # Database
 # https://docs.djangoproject.com/en/5.1/ref/settings/#databases
