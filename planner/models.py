@@ -10,7 +10,68 @@ from django.contrib.postgres.fields import ArrayField
 from django.core.validators import MinValueValidator
 import json
 
+# In planner/models.py, add after ConfigurationSet class
 
+class OptimizationHistory(models.Model):
+    """
+    Stores complete optimization session history for users to review.
+    """
+    user = models.ForeignKey('auth.User', on_delete=models.CASCADE, related_name='optimization_history')
+    job_name = models.CharField(max_length=255, default="Untitled Optimization")
+    
+    # Session data
+    uploaded_file_name = models.CharField(max_length=500)
+    uploaded_file_data = models.JSONField(default=list, help_text="Processed Excel data from upload")
+    selected_blocks = models.JSONField(default=list, help_text="Blocks selected by user")
+    selected_parents = models.JSONField(default=list, help_text="Parent blocks selected")
+
+    prism_summary = models.JSONField(default=list, blank=True, help_text="Summary of prism objects")
+    
+    
+    # Parameters used
+    parameters = models.JSONField(default=dict, help_text="Buffer spacing, etc.")
+    
+    # Results
+    optimization_results = models.JSONField(null=True, blank=True, help_text="Full optimization results")
+    efficiency = models.FloatField(default=0.0)
+    total_blocks_created = models.IntegerField(default=0)
+    total_parts_packed = models.IntegerField(default=0)
+    total_parts_requested = models.IntegerField(default=0)
+    
+    # Visualization references
+    block_visualization_urls = models.JSONField(default=list, blank=True)
+    scrap_visualization_urls = models.JSONField(default=list, blank=True)
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'optimization_history'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', 'created_at']),
+            models.Index(fields=['efficiency']),
+        ]
+    
+    def __str__(self):
+        return f"{self.job_name} - {self.user.username} - {self.created_at.strftime('%Y-%m-%d %H:%M')}"
+    
+    @property
+    def is_successful(self):
+        return self.efficiency > 0 and self.total_blocks_created > 0
+    
+    @property
+    def summary(self):
+        return {
+            'id': self.id,
+            'job_name': self.job_name,
+            'efficiency': self.efficiency,
+            'blocks_created': self.total_blocks_created,
+            'parts_packed': f"{self.total_parts_packed}/{self.total_parts_requested}",
+            'created_at': self.created_at,
+            'file_name': self.uploaded_file_name
+        }
 class StockBlock(models.Model):
     """
     Represents a stock block specification.

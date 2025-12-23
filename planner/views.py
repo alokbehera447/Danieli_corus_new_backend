@@ -420,6 +420,12 @@ def upload_and_optimize(request):
     - buffer_spacing: float (default: 2.0)
     """
     try:
+        from django.utils import timezone
+        from django.core.cache import cache
+        
+        # ====================
+        # 1. VALIDATE INPUTS
+        # ====================
         # Get uploaded file
         excel_file = request.FILES.get('file')
         if not excel_file:
@@ -443,13 +449,17 @@ def upload_and_optimize(request):
             }, status=400)
         
         print(f"\n=== OPTIMIZATION REQUEST ===")
+        print(f"User: {request.user.username}")
         print(f"File: {excel_file.name}")
         print(f"Selected blocks: {selected_blocks}")
         print(f"Parent blocks: {parent_blocks_data}")
         print(f"Buffer spacing: {buffer_spacing}")
         
-        # Validate and prepare parent block sizes
+        # ====================
+        # 2. PROCESS PARENT BLOCKS
+        # ====================
         parent_block_sizes = []
+        parent_labels = []
         
         # Handle the format sent from frontend
         for block in parent_blocks_data:
@@ -462,6 +472,7 @@ def upload_and_optimize(request):
                         dims.get('width', 0),
                         dims.get('height', 0)
                     ])
+                    parent_labels.append(block.get('label', f'Block_{len(parent_block_sizes)}'))
                 # Format: {"length": 1870, "width": 800, "height": 350}
                 elif 'length' in block and 'width' in block and 'height' in block:
                     parent_block_sizes.append([
@@ -469,9 +480,11 @@ def upload_and_optimize(request):
                         block['width'],
                         block['height']
                     ])
+                    parent_labels.append(f"{block['length']}×{block['width']}×{block['height']}")
             elif isinstance(block, list) and len(block) == 3:
                 # Format: [1870, 800, 350]
                 parent_block_sizes.append(block)
+                parent_labels.append(f"{block[0]}×{block[1]}×{block[2]}")
         
         if not parent_block_sizes:
             return Response({
@@ -495,11 +508,11 @@ def upload_and_optimize(request):
                 }, status=400)
         
         print(f"Parent block sizes to use: {parent_block_sizes}")
+        print(f"Parent block labels: {parent_labels}")
         
-        # Process Excel file and run optimization...
-        # ... rest of your existing upload_and_optimize code
-        
-        # Process Excel file
+        # ====================
+        # 3. PROCESS EXCEL FILE
+        # ====================
         if OptimizationEngine is None:
             return Response({
                 'success': False,
@@ -524,19 +537,23 @@ def upload_and_optimize(request):
         print(f"Processed {len(parts_data)} parts from Excel")
         
         # Filter selected blocks if specified
+        original_part_count = len(parts_data)
         if selected_blocks:
             parts_data = [p for p in parts_data if p['MARK'] in selected_blocks]
-            print(f"Filtered to {len(parts_data)} selected parts")
+            print(f"Filtered to {len(parts_data)} selected parts (from {original_part_count})")
         
-        # Check if packing modules are available
+        # ====================
+        # 4. CREATE PRISM OBJECTS
+        # ====================
         if Prisms is None or run_final_code is None:
             return Response({
                 'success': False,
                 'error': 'Packing modules not available'
             }, status=500)
         
-        # Create prism objects
         all_prisms = []
+        prism_summary = []
+        
         for part in parts_data:
             try:
                 size = [
@@ -551,6 +568,14 @@ def upload_and_optimize(request):
                     quantity=part['Nos']
                 )
                 all_prisms.append(prism)
+                prism_summary.append({
+                    'code': part['MARK'],
+                    'quantity': part['Nos'],
+                    'bottom_length': part['Bottom Length'],
+                    'top_length': part['Top Length'],
+                    'width': part['Width'],
+                    'height': part['Height']
+                })
             except Exception as e:
                 print(f"Error creating prism {part.get('MARK', 'Unknown')}: {e}")
                 continue
@@ -563,24 +588,24 @@ def upload_and_optimize(request):
         
         print(f"Created {len(all_prisms)} prism objects")
         
-        # Run the packing algorithm
+        # ====================
+        # 5. RUN PACKING ALGORITHM
+        # ====================
         try:
+            print(f"Running packing algorithm with {len(all_prisms)} prisms and {len(parent_block_sizes)} parent block sizes...")
             helper = run_final_code(
                 all_prisms=all_prisms,
                 buffer=buffer_spacing,
                 parent_block_sizes=parent_block_sizes
             )
-
-            # 🔥 STORE HELPER (Django-safe)
-            # GLOBAL_OPTIMIZATION_STATE["helper"] = helper
-
-            from django.core.cache import cache
-
+            
+            # Store helper in cache for visualization
             cache.set(
                 "latest_helper",
                 helper,
                 timeout=60 * 60  # 1 hour
             )
+            print(f"Packing complete! Cached helper for visualizations.")
 
         except Exception as e:
             print(f"ERROR in run_final_code: {str(e)}")
@@ -591,7 +616,9 @@ def upload_and_optimize(request):
                 'error': f'Packing algorithm failed: {str(e)}'
             }, status=500)
         
-        # Get detailed results
+        # ====================
+        # 6. PREPARE RESULTS
+        # ====================
         if get_block_details is None:
             return Response({
                 'success': False,
@@ -600,7 +627,6 @@ def upload_and_optimize(request):
         
         block_details = get_block_details(helper)
         
-        print(f"Packing complete!")
         print(f"Total blocks created: {len(helper.all_big_blocks)}")
         print(f"Total scraps: {len(helper.all_scrap)}")
         
@@ -657,7 +683,72 @@ def upload_and_optimize(request):
                 'volume': float(scrap.volume)
             })
         
-        # Prepare response
+        # ====================
+        # 7. SAVE TO HISTORY
+        # ====================
+        try:
+            # Check if OptimizationHistory model exists
+            from django.apps import apps
+            history_saved = False
+            history_id = None
+            
+            if apps.is_installed('planner'):
+                try:
+                    from .models import OptimizationHistory
+                    
+                    # Get a meaningful job name
+                    timestamp = timezone.now().strftime("%Y-%m-%d %H:%M")
+                    job_name = f"{excel_file.name.split('.')[0]} - {timestamp}"
+                    
+                    # Save to history
+                    history = OptimizationHistory.objects.create(
+                        user=request.user,
+                        job_name=job_name,
+                        uploaded_file_name=excel_file.name,
+                        uploaded_file_data=parts_data,  # Store the filtered parts data
+                        selected_blocks=selected_blocks,
+                        selected_parents=parent_labels,
+                        parameters={
+                            'buffer_spacing': buffer_spacing,
+                            'parent_blocks_used': parent_block_sizes,
+                            'parent_labels': parent_labels,
+                            'original_part_count': original_part_count,
+                            'filtered_part_count': len(parts_data)
+                        },
+                        optimization_results={
+                            'blocks': blocks_info,
+                            'scraps': scraps_info,
+                            'summary': {
+                                'efficiency': round(efficiency, 2),
+                                'total_parts_packed': total_parts_packed,
+                                'total_parts_requested': total_requested,
+                                'total_blocks_created': len(helper.all_big_blocks),
+                                'total_stock_volume': round(total_stock_volume, 2),
+                                'total_prism_volume': round(total_prism_volume, 2)
+                            }
+                        },
+                        efficiency=round(efficiency, 2),
+                        total_blocks_created=len(helper.all_big_blocks),
+                        total_parts_packed=total_parts_packed,
+                        total_parts_requested=total_requested,
+                        prism_summary=prism_summary
+                    )
+                    
+                    history_id = history.id
+                    history_saved = True
+                    print(f"[HISTORY] Saved optimization #{history.id} for user {request.user.username}")
+                    
+                except ImportError as ie:
+                    print(f"[HISTORY] OptimizationHistory model not found: {ie}")
+                except Exception as history_error:
+                    print(f"[HISTORY] Error saving history (non-critical): {history_error}")
+                    # Don't fail the main request if history saving fails
+        except Exception as history_error:
+            print(f"[HISTORY] Unexpected error in history saving: {history_error}")
+        
+        # ====================
+        # 8. PREPARE FINAL RESPONSE
+        # ====================
         results = {
             'success': True,
             'efficiency': round(efficiency, 2),
@@ -671,24 +762,264 @@ def upload_and_optimize(request):
             'blocks': blocks_info,
             'scraps': scraps_info,
             'parent_blocks_used': parent_block_sizes,
-            'message': f'Created {len(helper.all_big_blocks)} stock blocks with {efficiency:.2f}% efficiency'
+            'parent_labels': parent_labels,
+            'prism_summary': prism_summary,
+            'history_saved': history_saved,
+            'history_id': history_id,
+            'message': f'Created {len(helper.all_big_blocks)} stock blocks with {efficiency:.2f}% efficiency. '
+                      f'Packed {total_parts_packed} out of {total_requested} parts.',
+            'timestamp': timezone.now().isoformat(),
+            'user': request.user.username
         }
         
+        print(f"[RESPONSE] Returning optimization results with {len(blocks_info)} blocks")
         return Response(results)
         
     except Exception as e:
         print(f"ERROR in upload_and_optimize: {str(e)}")
         import traceback
         traceback.print_exc()
+        
+        # Try to save failed optimization to history
+        try:
+            from .models import OptimizationHistory
+            from django.utils import timezone
+            
+            OptimizationHistory.objects.create(
+                user=request.user,
+                job_name=f"Failed Optimization - {timezone.now().strftime('%Y-%m-%d %H:%M')}",
+                uploaded_file_name=excel_file.name if 'excel_file' in locals() else "Unknown",
+                optimization_results={'error': str(e)},
+                efficiency=0.0,
+                total_blocks_created=0,
+                total_parts_packed=0,
+                total_parts_requested=0,
+                error_message=str(e)
+            )
+        except:
+            pass  # Ignore history errors in error handler
+        
+        return Response({
+            'success': False,
+            'error': f"Optimization failed: {str(e)}"
+        }, status=500)
+
+# ================================
+# TEST ENDPOINTS
+# ================================
+
+
+# Add these new views to your views.py
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_optimization_history(request):
+    """
+    Get optimization history for the current user
+    
+    GET /api/optimization-history/
+    Returns list of all optimizations with summary
+    """
+    try:
+        from .models import OptimizationHistory
+        
+        # Get pagination parameters
+        page = int(request.GET.get('page', 1))
+        page_size = int(request.GET.get('page_size', 10))
+        
+        # Query history for current user
+        history = OptimizationHistory.objects.filter(user=request.user)
+        
+        # Get total count
+        total_count = history.count()
+        
+        # Paginate
+        start = (page - 1) * page_size
+        end = start + page_size
+        paginated_history = history[start:end]
+        
+        # Prepare response - return summary property
+        history_list = []
+        for item in paginated_history:
+            # Use the summary property you defined in the model
+            summary = item.summary
+            # Add any additional fields if needed
+            summary['id'] = item.id
+            history_list.append(summary)
+        
+        return Response({
+            'success': True,
+            'data': history_list,
+            'pagination': {
+                'page': page,
+                'page_size': page_size,
+                'total': total_count,
+                'total_pages': (total_count + page_size - 1) // page_size if page_size > 0 else 0,
+                'has_next': end < total_count,
+                'has_previous': page > 1
+            }
+        })
+        
+    except Exception as e:
+        print(f"[HISTORY] Error fetching history: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        return Response({
+            'success': False,
+            'error': str(e),
+            'data': []  # Always return empty array on error
+        }, status=500)
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_optimization_details(request, history_id):
+    """
+    Get full details of a specific optimization
+    
+    GET /api/optimization-history/<id>/
+    Returns complete optimization data
+    """
+    try:
+        from .models import OptimizationHistory
+        
+        # Get the history item
+        history = OptimizationHistory.objects.get(id=history_id, user=request.user)
+        
+        return Response({
+            'success': True,
+            'data': {
+                'id': history.id,
+                'job_name': history.job_name,
+                'created_at': history.created_at,
+                'efficiency': history.efficiency,
+                'uploaded_file_name': history.uploaded_file_name,
+                'uploaded_file_data': history.uploaded_file_data,
+                'selected_blocks': history.selected_blocks,
+                'selected_parents': history.selected_parents,
+                'parameters': history.parameters,
+                'optimization_results': history.optimization_results,
+                'summary': {
+                    'total_blocks_created': history.total_blocks_created,
+                    'total_parts_packed': history.total_parts_packed,
+                    'total_parts_requested': history.total_parts_requested,
+                    'is_successful': history.is_successful
+                }
+            }
+        })
+        
+    except OptimizationHistory.DoesNotExist:
+        return Response({
+            'success': False,
+            'error': 'Optimization not found or access denied'
+        }, status=404)
+    except Exception as e:
         return Response({
             'success': False,
             'error': str(e)
         }, status=500)
 
 
-# ================================
-# TEST ENDPOINTS
-# ================================
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def delete_optimization_history(request):
+    """
+    Delete optimization history items
+    
+    POST /api/optimization-history/delete/
+    Body: {"ids": [1, 2, 3]} or {"delete_all": true}
+    """
+    try:
+        from .models import OptimizationHistory
+        
+        data = request.data
+        ids_to_delete = data.get('ids', [])
+        delete_all = data.get('delete_all', False)
+        
+        # Validate
+        if not ids_to_delete and not delete_all:
+            return Response({
+                'success': False,
+                'error': 'No IDs provided and delete_all is false'
+            }, status=400)
+        
+        # Build query
+        query = OptimizationHistory.objects.filter(user=request.user)
+        
+        if delete_all:
+            count = query.count()
+            query.delete()
+            message = f"Deleted all {count} optimization records"
+        else:
+            query = query.filter(id__in=ids_to_delete)
+            count = query.count()
+            query.delete()
+            message = f"Deleted {count} optimization record(s)"
+        
+        return Response({
+            'success': True,
+            'message': message,
+            'deleted_count': count
+        })
+        
+    except Exception as e:
+        return Response({
+            'success': False,
+            'error': str(e)
+        }, status=500)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def rename_optimization(request, history_id):
+    """
+    Rename an optimization job
+    
+    POST /api/optimization-history/<id>/rename/
+    Body: {"new_name": "Production Run 2024"}
+    """
+    try:
+        from .models import OptimizationHistory
+        
+        history = OptimizationHistory.objects.get(id=history_id, user=request.user)
+        new_name = request.data.get('new_name', '').strip()
+        
+        if not new_name:
+            return Response({
+                'success': False,
+                'error': 'New name is required'
+            }, status=400)
+        
+        if len(new_name) > 255:
+            return Response({
+                'success': False,
+                'error': 'Name too long (max 255 characters)'
+            }, status=400)
+        
+        old_name = history.job_name
+        history.job_name = new_name
+        history.save()
+        
+        return Response({
+            'success': True,
+            'message': f'Renamed from "{old_name}" to "{new_name}"'
+        })
+        
+    except OptimizationHistory.DoesNotExist:
+        return Response({
+            'success': False,
+            'error': 'Optimization not found'
+        }, status=404)
+    except Exception as e:
+        return Response({
+            'success': False,
+            'error': str(e)
+        }, status=500)
+    
+
+
+
+
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
